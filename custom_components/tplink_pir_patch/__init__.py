@@ -19,11 +19,14 @@ from homeassistant.components.number import NumberDeviceClass, NumberMode
 from homeassistant.components.sensor import SensorStateClass
 from homeassistant.const import PERCENTAGE, UnitOfTime
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import UNDEFINED, ConfigType
 
 _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "tplink_pir_patch"
+
+CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
 
 
 def _patch_kasa_motion() -> None:
