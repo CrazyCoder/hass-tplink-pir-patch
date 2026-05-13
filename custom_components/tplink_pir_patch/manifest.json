@@ -1,7 +1,7 @@
 {
   "domain": "tplink_pir_patch",
   "name": "TP-Link Kasa PIR/Motion Sensor Patch",
-  "after_dependencies": ["tplink"],
+  "after_dependencies": [],
   "codeowners": ["@CrazyCoder"],
   "dependencies": [],
   "documentation": "https://github.com/CrazyCoder/hass-tplink-pir-patch",
