@@ -20,6 +20,3 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # Brands assets are only required for inclusion in the HACS default
-          # repository (we're distributed as a custom repository).
-          ignore: brands
