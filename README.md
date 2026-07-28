@@ -31,7 +31,8 @@ alone — it was already wired up upstream.
 
 ## Supported devices
 
-Tested on **ES20M(US)** with HW 1.0 / firmware `1.1.6 Build 250522 Rel.210254`.
+Developed against **ES20M(US)**, HW 1.0, firmware `1.1.6 Build 250522 Rel.210254`.
+These units lock up under polling, see [Lockups](#lockups-on-es20m--ks220m).
 
 Should also work on:
 
@@ -46,7 +47,8 @@ use `kasa.smart.modules.motionsensor` which already registers a proper
 
 - Home Assistant **2025.2** or newer (ships python-kasa ≥ 0.10.0)
 - HACS for the recommended install path
-- The device must have polling enabled in HA — see [Polling](#polling) below
+- The device must have polling enabled in HA — see [Polling](#polling) below.
+  On ES20M and KS220M, read [Lockups](#lockups-on-es20m--ks220m) first.
 
 ## Installation
 
@@ -80,6 +82,42 @@ appear to fire if your switch has polling off.
 for a "Polling" toggle in the ⋮ menu. Enable it. Default poll interval is
 5 seconds, which is also the motion-detection latency floor (local Kasa has
 no push).
+
+### Lockups on ES20M / KS220M
+
+A lot of ES20M and KS220M owners report the switch hard-locking after hours to
+days of Home Assistant polling. The physical button stops responding and only
+the reset button under the paddle brings it back. See
+[home-assistant/core#150044](https://github.com/home-assistant/core/issues/150044)
+and TP-Link threads
+[840580](https://community.tp-link.com/en/smart-home/forum/topic/840580),
+[849636](https://community.tp-link.com/en/home/forum/topic/849636),
+[855150](https://community.tp-link.com/en/home/forum/topic/855150). It happens
+to mine.
+
+This is not caused by this integration, and installing it does not make it more
+likely. python-kasa's `Motion.query()` merges `get_config` and `get_adc_value`
+into every update for these devices regardless of which entities exist, so stock
+HA has been reading the PIR ADC every 5 s since python-kasa 0.10.0. The patch
+adds no requests of its own.
+
+The same fact cuts the other way: disabling the PIR entities does not reduce
+polling load, only turning polling off does.
+[Confirmed by python-kasa's maintainer](https://github.com/home-assistant/core/issues/150044#issuecomment-3303540374).
+
+So on an affected switch you get one or the other, since
+`binary_sensor.<name>_motion` only updates while polling is on. I run mine with
+polling off and no motion entity.
+
+| Mitigation | Outcome |
+|---|---|
+| Disable polling for that device (⋮ → System options on its TP-Link device page) | Weeks of stability for several reporters, and for me. Motion entity stops updating. |
+| Turn off Smart Control in the Kasa app, plus the motion and ambient light sensors | [Freezes stopped, and came back immediately on re-enabling](https://github.com/home-assistant/core/issues/150044#issuecomment-3863725049) |
+| Firmware 1.1.6 Build 250522 Rel.210254 | TP-Link's fix for the 1.1.5 freeze bug. [People still freeze on 1.1.6](https://community.tp-link.com/en/home/forum/topic/855150), including me. Update anyway. |
+| Poll interval raised to 30 s | [Still froze](https://github.com/home-assistant/core/issues/150044#issuecomment-4694398074). Not a fix by itself. |
+
+TP-Link's position is that Home Assistant is unsupported and you should
+disconnect from it.
 
 ## Automation example
 
