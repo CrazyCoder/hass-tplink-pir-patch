@@ -5,12 +5,14 @@ For ES20M / KS200M motion-sensor switches (iot module). Adds:
   - sensor pir_value / pir_percent / pir_adc_* (debug ones disabled by default)
   - number pir_cold_time — inactivity timeout (python-kasa exposes the setter but no Feature)
 
-Loaded via configuration.yaml (stage 4), runs before tplink config entries (stage 5),
-so SENSOR/NUMBER/BINARY_SENSOR description maps are mutated before tplink reads them.
+Loaded via configuration.yaml. tplink is set up concurrently in the same
+bootstrap stage, so the SENSOR/NUMBER/BINARY_SENSOR description maps must be
+mutated before tplink forwards its platform setups — see async_setup.
 """
 from __future__ import annotations
 
 import logging
+from typing import Any, NamedTuple
 
 import dataclasses
 
@@ -29,9 +31,60 @@ DOMAIN = "tplink_pir_patch"
 CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
 
 
-def _patch_kasa_motion() -> None:
+class _Deps(NamedTuple):
+    """The python-kasa / HA tplink modules the patches operate on."""
+
+    Feature: Any
+    Motion: Any
+    tplink_bs: Any
+    tplink_entity: Any
+    tplink_number: Any
+    tplink_select: Any
+    tplink_sensor: Any
+
+
+def _load_deps() -> _Deps:
+    """Import python-kasa and the HA tplink platform modules.
+
+    Must run OFF the event loop. Python's import machinery hits the filesystem
+    (it scans sys.path — which includes /config/deps — and reads dist-info
+    metadata), which HA's blocking-call detector flags and which stalls the
+    loop for over a second. HA imports custom-integration modules in its
+    dedicated import executor, so doing this at module scope keeps it off the
+    loop without async_setup having to await anything.
+    """
     from kasa.feature import Feature
     from kasa.iot.modules.motion import Motion
+
+    from homeassistant.components.tplink import binary_sensor as tplink_bs
+    from homeassistant.components.tplink import entity as tplink_entity
+    from homeassistant.components.tplink import number as tplink_number
+    from homeassistant.components.tplink import select as tplink_select
+    from homeassistant.components.tplink import sensor as tplink_sensor
+
+    return _Deps(
+        Feature=Feature,
+        Motion=Motion,
+        tplink_bs=tplink_bs,
+        tplink_entity=tplink_entity,
+        tplink_number=tplink_number,
+        tplink_select=tplink_select,
+        tplink_sensor=tplink_sensor,
+    )
+
+
+try:
+    _DEPS: _Deps | None = _load_deps()
+except ImportError as err:
+    # tplink's requirements (python-kasa) may not be installed yet the very
+    # first time HA imports this module. async_setup retries.
+    _LOGGER.debug("tplink_pir_patch: deferring import of kasa/tplink (%s)", err)
+    _DEPS = None
+
+
+def _patch_kasa_motion(deps: _Deps) -> None:
+    Feature = deps.Feature
+    Motion = deps.Motion
 
     if getattr(Motion._initialize_features, "_pir_patched", False):
         return
@@ -78,12 +131,12 @@ def _patch_kasa_motion() -> None:
     Motion._initialize_features = _patched
 
 
-def _patch_ha_tplink() -> None:
-    from homeassistant.components.tplink import binary_sensor as tplink_bs
-    from homeassistant.components.tplink import entity as tplink_entity
-    from homeassistant.components.tplink import number as tplink_number
-    from homeassistant.components.tplink import select as tplink_select
-    from homeassistant.components.tplink import sensor as tplink_sensor
+def _patch_ha_tplink(deps: _Deps) -> None:
+    tplink_bs = deps.tplink_bs
+    tplink_entity = deps.tplink_entity
+    tplink_number = deps.tplink_number
+    tplink_select = deps.tplink_select
+    tplink_sensor = deps.tplink_sensor
 
     sensor_descs = (
         tplink_sensor.TPLinkSensorEntityDescription(
@@ -180,9 +233,27 @@ def _patch_ha_tplink() -> None:
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    # Deliberately await-free: tplink is set up concurrently in the same
+    # bootstrap stage, and its platforms read the description maps we mutate
+    # here. Yielding to the event loop turns that ordering into a race — an
+    # awaited import executor job measured a 36 ms margin, versus 17 s when
+    # the patches are applied without yielding. Imports happen at module
+    # scope (in HA's import executor) for exactly this reason.
+    deps = _DEPS
+    if deps is None:
+        try:
+            # Rare: kasa was not importable when this module loaded. Retrying
+            # here blocks the loop briefly, which beats not loading at all.
+            deps = _load_deps()
+        except ImportError:
+            _LOGGER.exception(
+                "tplink_pir_patch: python-kasa / tplink not importable; "
+                "is the TP-Link integration installed?"
+            )
+            return False
     try:
-        _patch_kasa_motion()
-        _patch_ha_tplink()
+        _patch_kasa_motion(deps)
+        _patch_ha_tplink(deps)
     except Exception:
         _LOGGER.exception("tplink_pir_patch: setup failed")
         return False

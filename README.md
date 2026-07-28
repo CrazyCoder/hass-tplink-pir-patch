@@ -140,9 +140,19 @@ of the switch.
 
 ## How it works (technical)
 
-The shim is a tiny custom integration loaded via `configuration.yaml` so its
-`async_setup` runs in HA's bootstrap stage 4 — before tplink config entries
-are processed in stage 5.
+The shim is a tiny custom integration loaded via `configuration.yaml`. It and
+tplink are set up concurrently in the same bootstrap stage, so ordering is
+what matters: `async_setup` is deliberately **await-free**, which makes the
+description-map mutations below atomic with respect to the event loop and
+guarantees they land before tplink forwards its platform setups.
+
+For the same reason, python-kasa and the tplink platform modules are imported
+at **module scope** rather than inside `async_setup`. HA imports
+custom-integration modules in its dedicated import executor, so this keeps
+Python's import machinery (which scans `sys.path`, including `/config/deps`,
+and reads dist-info metadata) off the event loop — importing inside
+`async_setup` tripped HA's blocking-call detector and stalled the loop for
+~1.4 s ([#1](https://github.com/CrazyCoder/hass-tplink-pir-patch/issues/1)).
 
 It then applies four runtime patches:
 
