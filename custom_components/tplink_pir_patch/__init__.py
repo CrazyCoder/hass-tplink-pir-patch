@@ -107,14 +107,26 @@ async def _safe_reboot(self) -> None:
     the stock `reboot` button, or the physical reset button on the switch.
 
     So the sequence is reboot, wait for the device to answer again, then toggle
-    `set_enabled` off and back on. Skipped entirely when the PIR was already
-    disabled, since there is nothing to re-arm.
+    `set_enabled` off and back on. The re-arm is skipped when the PIR was already
+    disabled, but the wait is not — coming back is what tells us the reboot
+    worked, and a switch that never returns is the failure worth logging.
 
     This blocks for as long as the switch takes to come back, up to
     _REBOOT_WAIT seconds. A button press in the UI will spin for that long.
     """
     dev = self._device
-    was_enabled = bool(self.enabled)
+    try:
+        was_enabled = bool(self.enabled)
+    except Exception:  # noqa: BLE001 - module data may not be populated yet
+        # Default to no re-arm: wrongly enabling a PIR the user turned off is
+        # worse than skipping a re-arm, which this warning tells them to redo.
+        was_enabled = False
+        _LOGGER.warning(
+            "tplink_pir_patch: could not read PIR state of %s; rebooting without "
+            "re-arming — check its Motion sensor switch afterwards",
+            dev.host,
+            exc_info=True,
+        )
     _LOGGER.info(
         "tplink_pir_patch: safe restart of %s (pir_enabled=%s)", dev.host, was_enabled
     )
@@ -126,11 +138,9 @@ async def _safe_reboot(self) -> None:
             dev.host,
             exc_info=True,
         )
-    if not was_enabled:
-        return
 
-    await asyncio.sleep(_REBOOT_SETTLE)
     deadline = time.monotonic() + _REBOOT_WAIT
+    await asyncio.sleep(_REBOOT_SETTLE)
     while time.monotonic() < deadline:
         try:
             await dev.update()
@@ -139,10 +149,18 @@ async def _safe_reboot(self) -> None:
             await asyncio.sleep(3)
     else:
         _LOGGER.warning(
-            "tplink_pir_patch: %s did not answer within %ss after reboot; "
-            "PIR left disarmed — toggle its Motion sensor switch off and on",
+            "tplink_pir_patch: %s did not answer within %ss after reboot%s",
             dev.host,
             _REBOOT_WAIT,
+            "; PIR left disarmed — toggle its Motion sensor switch off and on"
+            if was_enabled
+            else "",
+        )
+        return
+
+    if not was_enabled:
+        _LOGGER.info(
+            "tplink_pir_patch: %s rebooted (PIR disabled, nothing to re-arm)", dev.host
         )
         return
 
