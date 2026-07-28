@@ -25,6 +25,7 @@ For each supported Kasa motion-sensor switch:
 | `sensor.<name>_pir_value` | Signed deviation of the ADC reading from midpoint (the value compared to the threshold). |
 | `sensor.<name>_pir_percentile` | Same, expressed as `%` of half-range. |
 | `sensor.<name>_pir_adc_value` / `_min` / `_mid` / `_max` | Raw ADC (disabled-by-default diagnostic entities). |
+| `button.<name>_safe_restart` | Reboots the switch and re-arms the PIR afterwards. See [Rebooting disarms the PIR](#rebooting-disarms-the-pir). |
 
 The existing `switch.<name>_motion_sensor` (toggles the PIR on/off) is left
 alone — it was already wired up upstream.
@@ -118,6 +119,52 @@ polling off and no motion entity.
 
 TP-Link's position is that Home Assistant is unsupported and you should
 disconnect from it.
+
+A rebooted switch comes back with its load state intact (on stays on, off stays
+off), so a scheduled restart is cheap. The one thing it does break is the motion
+sensor, which is why this integration ships a restart button that handles it.
+
+### Rebooting disarms the PIR
+
+**After any reboot the switch stops reacting to motion, while continuing to
+report that the sensor is enabled.** `smartlife.iot.PIR get_config` still returns
+`enable: 1`, HA still shows the Motion sensor switch as on, but the device's
+built-in Smart Control no longer drives the load and `pir_triggered` stops
+firing. Toggling the sensor off and on again restores it.
+
+This applies to every reboot, including the physical reset button — which is the
+one TP-Link tells you to press when the switch freezes. So the standard advice
+for the lockup silently leaves your motion sensor dead.
+
+`button.<name>_safe_restart` does the whole sequence: reboot, wait for the device
+to answer again, then toggle `set_enabled` off and back on. It skips the re-arm
+when the PIR was already disabled. The press blocks until the switch is back, up
+to 120 s — a healthy ES20M answers again in about 8 s, a degraded one has been
+measured at over 40 s. If the device never comes back it logs a warning telling
+you to toggle the sensor by hand.
+
+Home Assistant also has a stock `button.<name>_restart` for every Kasa device,
+supplied by python-kasa's `reboot` feature and hidden because that feature is
+`Category.Debug`. Enable it under the device's entity list if you want it. It
+does **not** re-arm the PIR.
+
+A nightly restart is worth trying as a mitigation for the lockups above, on the
+theory that the fault accumulates and a reboot is the only thing that resets it:
+
+```yaml
+- alias: "Kasa ES20M: nightly preventive reboot"
+  triggers:
+    - trigger: time
+      at: "04:00:00"
+  actions:
+    - action: button.press
+      target:
+        entity_id: button.garage_light_safe_restart
+      continue_on_error: true
+```
+
+Unverified as a fix — it is being tested. Reported here because nobody in
+[core#150044](https://github.com/home-assistant/core/issues/150044) has tried it.
 
 ## Automation example
 

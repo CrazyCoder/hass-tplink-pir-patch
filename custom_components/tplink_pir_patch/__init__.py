@@ -4,6 +4,7 @@ For ES20M / KS200M motion-sensor switches (iot module). Adds:
   - binary_sensor pir_triggered (device_class=motion) — flipped from python-kasa's Sensor
   - sensor pir_value / pir_percent / pir_adc_* (debug ones disabled by default)
   - number pir_cold_time — inactivity timeout (python-kasa exposes the setter but no Feature)
+  - button reboot_safe — reboot that re-arms the PIR afterwards (see _safe_reboot)
 
 Loaded via configuration.yaml. tplink is set up concurrently in the same
 bootstrap stage, so the SENSOR/NUMBER/BINARY_SENSOR description maps must be
@@ -11,12 +12,15 @@ mutated before tplink forwards its platform setups — see async_setup.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any, NamedTuple
 
 import dataclasses
 
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
+from homeassistant.components.button import ButtonDeviceClass
 from homeassistant.components.number import NumberDeviceClass, NumberMode
 from homeassistant.components.sensor import SensorStateClass
 from homeassistant.const import PERCENTAGE, UnitOfTime
@@ -30,6 +34,13 @@ DOMAIN = "tplink_pir_patch"
 
 CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
 
+# Seconds to wait after issuing the reboot before the first liveness probe, how
+# long to keep probing, and the off->on gap of the PIR re-arm. A healthy ES20M
+# answers again after ~8 s; a degraded one has been measured at over 40 s.
+_REBOOT_SETTLE = 8
+_REBOOT_WAIT = 120
+_PIR_TOGGLE_GAP = 1.0
+
 
 class _Deps(NamedTuple):
     """The python-kasa / HA tplink modules the patches operate on."""
@@ -37,6 +48,7 @@ class _Deps(NamedTuple):
     Feature: Any
     Motion: Any
     tplink_bs: Any
+    tplink_button: Any
     tplink_entity: Any
     tplink_number: Any
     tplink_select: Any
@@ -57,6 +69,7 @@ def _load_deps() -> _Deps:
     from kasa.iot.modules.motion import Motion
 
     from homeassistant.components.tplink import binary_sensor as tplink_bs
+    from homeassistant.components.tplink import button as tplink_button
     from homeassistant.components.tplink import entity as tplink_entity
     from homeassistant.components.tplink import number as tplink_number
     from homeassistant.components.tplink import select as tplink_select
@@ -66,6 +79,7 @@ def _load_deps() -> _Deps:
         Feature=Feature,
         Motion=Motion,
         tplink_bs=tplink_bs,
+        tplink_button=tplink_button,
         tplink_entity=tplink_entity,
         tplink_number=tplink_number,
         tplink_select=tplink_select,
@@ -82,12 +96,78 @@ except ImportError as err:
     _DEPS = None
 
 
+async def _safe_reboot(self) -> None:
+    """Reboot the switch, then re-arm the PIR.
+
+    A reboot silently disarms the motion sensor. `smartlife.iot.PIR get_config`
+    still reports `enable: 1` and HA still shows the Motion sensor switch as on,
+    but the device no longer reacts to motion — its built-in Smart Control stops
+    driving the load, and pir_triggered stops firing. Toggling the sensor off and
+    on again restores it. That is true of a reboot from any source: this action,
+    the stock `reboot` button, or the physical reset button on the switch.
+
+    So the sequence is reboot, wait for the device to answer again, then toggle
+    `set_enabled` off and back on. Skipped entirely when the PIR was already
+    disabled, since there is nothing to re-arm.
+
+    This blocks for as long as the switch takes to come back, up to
+    _REBOOT_WAIT seconds. A button press in the UI will spin for that long.
+    """
+    dev = self._device
+    was_enabled = bool(self.enabled)
+    _LOGGER.info(
+        "tplink_pir_patch: safe restart of %s (pir_enabled=%s)", dev.host, was_enabled
+    )
+    try:
+        await dev.reboot(delay=1)
+    except Exception:  # noqa: BLE001 - device drops the connection mid-reboot
+        _LOGGER.debug(
+            "tplink_pir_patch: reboot call raised for %s (expected)",
+            dev.host,
+            exc_info=True,
+        )
+    if not was_enabled:
+        return
+
+    await asyncio.sleep(_REBOOT_SETTLE)
+    deadline = time.monotonic() + _REBOOT_WAIT
+    while time.monotonic() < deadline:
+        try:
+            await dev.update()
+            break
+        except Exception:  # noqa: BLE001 - still rebooting / reassociating
+            await asyncio.sleep(3)
+    else:
+        _LOGGER.warning(
+            "tplink_pir_patch: %s did not answer within %ss after reboot; "
+            "PIR left disarmed — toggle its Motion sensor switch off and on",
+            dev.host,
+            _REBOOT_WAIT,
+        )
+        return
+
+    try:
+        await self.set_enabled(False)
+        await asyncio.sleep(_PIR_TOGGLE_GAP)
+        await self.set_enabled(True)
+    except Exception:
+        _LOGGER.exception(
+            "tplink_pir_patch: failed to re-arm PIR on %s — toggle its Motion "
+            "sensor switch off and on",
+            dev.host,
+        )
+    else:
+        _LOGGER.info("tplink_pir_patch: %s rebooted and PIR re-armed", dev.host)
+
+
 def _patch_kasa_motion(deps: _Deps) -> None:
     Feature = deps.Feature
     Motion = deps.Motion
 
     if getattr(Motion._initialize_features, "_pir_patched", False):
         return
+
+    Motion.safe_reboot = _safe_reboot
 
     _original = Motion._initialize_features
 
@@ -113,6 +193,26 @@ def _patch_kasa_motion(deps: _Deps) -> None:
                 )
             except Exception:
                 _LOGGER.exception("tplink_pir_patch: failed to add pir_cold_time")
+        # Reboot that re-arms the PIR afterwards. Registered on the Motion
+        # module rather than the device so it only appears on PIR-capable
+        # switches — the stock `reboot` feature (Category.Debug, so disabled by
+        # default in HA) exists on every Kasa iot device and is left alone.
+        if "reboot_safe" not in self._module_features:
+            try:
+                self._add_feature(
+                    Feature(
+                        device=self._device,
+                        container=self,
+                        id="reboot_safe",
+                        name="Safe restart",
+                        icon="mdi:restart-alert",
+                        attribute_setter="safe_reboot",
+                        type=Feature.Type.Action,
+                        category=Feature.Category.Config,
+                    )
+                )
+            except Exception:
+                _LOGGER.exception("tplink_pir_patch: failed to add reboot_safe")
         # Flip pir_triggered Sensor -> BinarySensor so HA wires it to the
         # binary_sensor platform with device_class=motion.
         if "pir_triggered" in self._module_features:
@@ -133,6 +233,7 @@ def _patch_kasa_motion(deps: _Deps) -> None:
 
 def _patch_ha_tplink(deps: _Deps) -> None:
     tplink_bs = deps.tplink_bs
+    tplink_button = deps.tplink_button
     tplink_entity = deps.tplink_entity
     tplink_number = deps.tplink_number
     tplink_select = deps.tplink_select
@@ -205,6 +306,13 @@ def _patch_ha_tplink(deps: _Deps) -> None:
         name="Motion sensor range",
     )
     tplink_select.SELECT_DESCRIPTIONS_MAP.setdefault(select_desc.key, select_desc)
+
+    button_desc = tplink_button.TPLinkButtonEntityDescription(
+        key="reboot_safe",
+        name="Safe restart",
+        device_class=ButtonDeviceClass.RESTART,
+    )
+    tplink_button.BUTTON_DESCRIPTIONS_MAP.setdefault(button_desc.key, button_desc)
 
     # pir_triggered is Feature.Category.Primary; on Dimmer the integration filters
     # Primary features unless explicitly allowlisted.
