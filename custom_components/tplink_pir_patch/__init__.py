@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import string
 import time
 from typing import Any, NamedTuple
 
 import dataclasses
+import voluptuous as vol
 
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.button import ButtonDeviceClass
@@ -32,7 +34,35 @@ _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "tplink_pir_patch"
 
-CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
+CONF_CLOSE_CONNECTION_AFTER_POLL = "close_connection_after_poll"
+
+
+def _normalize_mac(value: str) -> str:
+    """Validate and normalize a MAC address for reliable comparisons."""
+    mac = cv.string(value).translate(str.maketrans("", "", ":-.")).upper()
+    if len(mac) != 12 or any(char not in string.hexdigits for char in mac):
+        raise vol.Invalid(f"invalid MAC address: {value}")
+    return mac
+
+
+CONFIG_SCHEMA = vol.Schema(
+    {
+        DOMAIN: vol.All(
+            lambda value: value or {},
+            vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_CLOSE_CONNECTION_AFTER_POLL, default=[]
+                    ): vol.All(cv.ensure_list, [_normalize_mac]),
+                }
+            ),
+        )
+    },
+    extra=vol.ALLOW_EXTRA,
+)
+
+_CLOSE_CONNECTION_AFTER_POLL_MACS: frozenset[str] = frozenset()
+_UNSUPPORTED_PROTOCOL_WARNED_MACS: set[str] = set()
 
 # Seconds to wait after issuing the reboot before the first liveness probe, how
 # long to keep probing, and the off->on gap of the PIR re-arm. A healthy ES20M
@@ -46,9 +76,12 @@ class _Deps(NamedTuple):
     """The python-kasa / HA tplink modules the patches operate on."""
 
     Feature: Any
+    IotProtocol: Any
     Motion: Any
+    XorTransport: Any
     tplink_bs: Any
     tplink_button: Any
+    tplink_coordinator: Any
     tplink_entity: Any
     tplink_number: Any
     tplink_select: Any
@@ -67,9 +100,12 @@ def _load_deps() -> _Deps:
     """
     from kasa.feature import Feature
     from kasa.iot.modules.motion import Motion
+    from kasa.protocols import IotProtocol
+    from kasa.transports import XorTransport
 
     from homeassistant.components.tplink import binary_sensor as tplink_bs
     from homeassistant.components.tplink import button as tplink_button
+    from homeassistant.components.tplink import coordinator as tplink_coordinator
     from homeassistant.components.tplink import entity as tplink_entity
     from homeassistant.components.tplink import number as tplink_number
     from homeassistant.components.tplink import select as tplink_select
@@ -77,9 +113,12 @@ def _load_deps() -> _Deps:
 
     return _Deps(
         Feature=Feature,
+        IotProtocol=IotProtocol,
         Motion=Motion,
+        XorTransport=XorTransport,
         tplink_bs=tplink_bs,
         tplink_button=tplink_button,
+        tplink_coordinator=tplink_coordinator,
         tplink_entity=tplink_entity,
         tplink_number=tplink_number,
         tplink_select=tplink_select,
@@ -178,6 +217,50 @@ async def _safe_reboot(self) -> None:
         _LOGGER.info("tplink_pir_patch: %s rebooted and PIR re-armed", dev.host)
 
 
+async def _close_connection_after_poll(device: Any, deps: _Deps) -> None:
+    """Close a selected legacy device's TCP connection without racing queries."""
+    try:
+        mac = _normalize_mac(device.mac)
+    except Exception:  # noqa: BLE001 - no sysinfo after a failed first update
+        return
+
+    if mac not in _CLOSE_CONNECTION_AFTER_POLL_MACS:
+        return
+
+    protocol = device.protocol
+    if not isinstance(protocol, deps.IotProtocol) or not isinstance(
+        protocol._transport, deps.XorTransport
+    ):
+        if mac not in _UNSUPPORTED_PROTOCOL_WARNED_MACS:
+            _UNSUPPORTED_PROTOCOL_WARNED_MACS.add(mac)
+            _LOGGER.warning(
+                "tplink_pir_patch: %s (%s) was selected for close-after-poll, "
+                "but it does not use the legacy XOR/TCP protocol; ignoring it",
+                device.host,
+                device.mac,
+            )
+        return
+
+    # IotProtocol serializes every update and service call with this lock.
+    # Closing under the same lock prevents a poll-finalizer from tearing down
+    # the socket while an entity command is using it.
+    try:
+        async with protocol._query_lock:
+            await protocol.close()
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - closing must not make a good poll fail
+        _LOGGER.warning(
+            "tplink_pir_patch: failed to close TCP connection after polling %s",
+            device.host,
+            exc_info=True,
+        )
+    else:
+        _LOGGER.debug(
+            "tplink_pir_patch: closed TCP connection after polling %s", device.host
+        )
+
+
 def _patch_kasa_motion(deps: _Deps) -> None:
     Feature = deps.Feature
     Motion = deps.Motion
@@ -252,6 +335,7 @@ def _patch_kasa_motion(deps: _Deps) -> None:
 def _patch_ha_tplink(deps: _Deps) -> None:
     tplink_bs = deps.tplink_bs
     tplink_button = deps.tplink_button
+    tplink_coordinator = deps.tplink_coordinator
     tplink_entity = deps.tplink_entity
     tplink_number = deps.tplink_number
     tplink_select = deps.tplink_select
@@ -357,6 +441,26 @@ def _patch_ha_tplink(deps: _Deps) -> None:
         _patched_dff._pir_name_patched = True
         feat_entity_cls._description_for_feature = classmethod(_patched_dff)
 
+    # python-kasa intentionally keeps legacy TCP/9999 sockets open between
+    # queries. For explicitly selected devices, close the socket after the
+    # coordinator finishes a poll so the next poll reconnects. Keep this at the
+    # coordinator boundary (rather than wrapping every query) so a full update
+    # remains one serialized transaction and entity commands are unaffected.
+    coordinator_cls = tplink_coordinator.TPLinkDataUpdateCoordinator
+    if not getattr(
+        coordinator_cls._async_update_data, "_pir_close_after_poll_patched", False
+    ):
+        _orig_update_data = coordinator_cls._async_update_data
+
+        async def _patched_update_data(self) -> None:
+            try:
+                return await _orig_update_data(self)
+            finally:
+                await _close_connection_after_poll(self.device, deps)
+
+        _patched_update_data._pir_close_after_poll_patched = True
+        coordinator_cls._async_update_data = _patched_update_data
+
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     # Deliberately await-free: tplink is set up concurrently in the same
@@ -365,6 +469,12 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     # awaited import executor job measured a 36 ms margin, versus 17 s when
     # the patches are applied without yielding. Imports happen at module
     # scope (in HA's import executor) for exactly this reason.
+    global _CLOSE_CONNECTION_AFTER_POLL_MACS
+
+    _CLOSE_CONNECTION_AFTER_POLL_MACS = frozenset(
+        config[DOMAIN][CONF_CLOSE_CONNECTION_AFTER_POLL]
+    )
+
     deps = _DEPS
     if deps is None:
         try:
@@ -383,5 +493,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     except Exception:
         _LOGGER.exception("tplink_pir_patch: setup failed")
         return False
-    _LOGGER.info("tplink_pir_patch: kasa Motion + HA tplink descriptions patched")
+    _LOGGER.info(
+        "tplink_pir_patch: kasa Motion + HA tplink descriptions patched; "
+        "close-after-poll enabled for %d device(s)",
+        len(_CLOSE_CONNECTION_AFTER_POLL_MACS),
+    )
     return True

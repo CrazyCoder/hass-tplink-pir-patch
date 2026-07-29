@@ -116,6 +116,7 @@ polling off and no motion entity.
 | Turn off Smart Control in the Kasa app, plus the motion and ambient light sensors | [Freezes stopped, and came back immediately on re-enabling](https://github.com/home-assistant/core/issues/150044#issuecomment-3863725049) |
 | Firmware 1.1.6 Build 250522 Rel.210254 | TP-Link's fix for the 1.1.5 freeze bug. [People still freeze on 1.1.6](https://community.tp-link.com/en/home/forum/topic/855150), including me. Update anyway. |
 | Poll interval raised to 30 s | [Still froze](https://github.com/home-assistant/core/issues/150044#issuecomment-4694398074). Not a fix by itself. |
+| Close TCP after every poll | Experimental opt-in supplied by this integration; reconnects on the next poll. No stability result yet, and upstream warns that repeated reconnects strained other legacy Kasa devices. |
 
 TP-Link's position is that Home Assistant is unsupported and you should
 disconnect from it.
@@ -123,6 +124,40 @@ disconnect from it.
 A rebooted switch comes back with its load state intact (on stays on, off stays
 off), so a scheduled restart is cheap. The one thing it does break is the motion
 sensor, which is why this integration ships a restart button that handles it.
+
+### Experimental close-after-poll mode
+
+Legacy Kasa devices use unencrypted XOR-over-TCP on port 9999. python-kasa keeps
+that connection open and reuses it across Home Assistant's 5-second polls. The
+ES20M lockup may involve a collision between that long-lived session and the
+switch's built-in Smart Control processing, so this integration can close the
+connection after each completed coordinator poll for an explicit MAC allowlist:
+
+```yaml
+tplink_pir_patch:
+  close_connection_after_poll:
+    - "B0:A7:B9:1B:78:D0"
+```
+
+The next poll opens a new connection. A complete `device.update()` still uses
+one connection, and the close takes python-kasa's query lock so it cannot race a
+Home Assistant light command. Only legacy `IotProtocol` + `XorTransport`
+devices are eligible; selecting an HTTP/KLAP device logs a warning and does
+nothing.
+
+This is deliberately opt-in and experimental. python-kasa changed in the
+opposite direction in
+[PR #213](https://github.com/python-kasa/python-kasa/pull/213): maintainers
+found that constant disconnect/reconnect cycles appeared to strain legacy
+devices, persistent serialized queries made polling much faster, and the
+behavior seemed to match the iOS app. Their measured HS300 workload dropped
+from about 8.5 seconds to 3.4 seconds. The ES20M may have a different firmware
+defect, but reconnecting every five seconds is not an upstream-recommended
+general setting.
+
+Changing the allowlist requires a full Home Assistant restart. Remove the MAC
+addresses (or the option) to restore python-kasa's normal persistent connection
+behavior.
 
 ### Rebooting disarms the PIR
 
@@ -239,7 +274,7 @@ and reads dist-info metadata) off the event loop — importing inside
 `async_setup` tripped HA's blocking-call detector and stalled the loop for
 ~1.4 s ([#1](https://github.com/CrazyCoder/hass-tplink-pir-patch/issues/1)).
 
-It then applies four runtime patches:
+It then applies five runtime patches:
 
 1. **`kasa.iot.modules.motion.Motion._initialize_features`** is wrapped to:
    - flip `pir_triggered.type` from `Feature.Type.Sensor` to
@@ -268,6 +303,12 @@ It then applies four runtime patches:
    `Master Vanity Light` with no suffix (only the device name) because there's
    no translation entry for the keys. Built-in tplink features that rely on
    translation are unaffected since their descriptions don't set `name`.
+
+5. **`TPLinkDataUpdateCoordinator._async_update_data`** is wrapped so devices
+   selected by `close_connection_after_poll` close their legacy XOR/TCP
+   protocol after each poll. The close uses `IotProtocol._query_lock` to avoid
+   racing entity commands. Unselected devices retain stock python-kasa
+   connection reuse.
 
 The description maps and `FEATURES_ALLOW_LIST` are plain dicts/sets at module
 level, so direct mutation persists for the life of the HA process. python-kasa's
