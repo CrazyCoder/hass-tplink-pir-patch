@@ -248,10 +248,10 @@ of the switch.
   own.
 
 - **`binary_sensor.<name>_motion` is computed, not the device's hardware
-  state.** python-kasa evaluates
-  `enabled AND abs(pir_percent) > (100 − threshold)` on every poll using the
-  raw ADC reading. So the binary_sensor tracks the live PIR signal at the
-  poll interval rather than the switch's internal motion-active window.
+  state.** The patch evaluates `abs(pir_percent) > (100 − threshold)`
+  on each existing poll. The binary sensor can report motion while the
+  switch's motion setting is off, as long as the device still reports a
+  live PIR signal. This does not change the switch's Smart Control settings.
 
 - **5 s polling cadence is the latency floor** for local Kasa. Cannot be
   reduced without changing python-kasa's polling logic. Adequate for typical

@@ -261,6 +261,12 @@ async def _close_connection_after_poll(device: Any, deps: _Deps) -> None:
         )
 
 
+def _detect_pir_motion(motion: Any) -> bool:
+    """Evaluate the cached PIR sample independently of Smart Control."""
+    sample = motion.pir_state
+    return abs(sample.pir_percent) > (100 - sample.pir_config.threshold)
+
+
 def _patch_kasa_motion(deps: _Deps) -> None:
     Feature = deps.Feature
     Motion = deps.Motion
@@ -314,10 +320,11 @@ def _patch_kasa_motion(deps: _Deps) -> None:
                 )
             except Exception:
                 _LOGGER.exception("tplink_pir_patch: failed to add reboot_safe")
-        # Flip pir_triggered Sensor -> BinarySensor so HA wires it to the
-        # binary_sensor platform with device_class=motion.
-        if "pir_triggered" in self._module_features:
-            self._module_features["pir_triggered"].type = Feature.Type.BinarySensor
+        # Expose the PIR reading as motion even when the device's motion
+        # setting is off. This changes only the Home Assistant feature getter.
+        if pir_triggered := self._module_features.get("pir_triggered"):
+            pir_triggered.type = Feature.Type.BinarySensor
+            pir_triggered.attribute_getter = _detect_pir_motion
         # python-kasa registers pir_range with attribute_getter="range" returning
         # a Range enum, but choices_getter="ranges" returns string names. HA's
         # SelectEntity compares feature.value (enum) to options (strings) and
