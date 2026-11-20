@@ -76,6 +76,7 @@ _PIR_TOGGLE_GAP = 1.0
 class _Deps(NamedTuple):
     """The python-kasa / HA tplink modules the patches operate on."""
 
+    AmbientLight: Any
     Feature: Any
     IotProtocol: Any
     Motion: Any
@@ -87,6 +88,7 @@ class _Deps(NamedTuple):
     tplink_number: Any
     tplink_select: Any
     tplink_sensor: Any
+    tplink_switch: Any
 
 
 def _load_deps() -> _Deps:
@@ -100,6 +102,7 @@ def _load_deps() -> _Deps:
     loop without async_setup having to await anything.
     """
     from kasa.feature import Feature
+    from kasa.iot.modules.ambientlight import AmbientLight
     from kasa.iot.modules.motion import Motion
     from kasa.protocols import IotProtocol
     from kasa.transports import XorTransport
@@ -112,7 +115,11 @@ def _load_deps() -> _Deps:
     from homeassistant.components.tplink import select as tplink_select
     from homeassistant.components.tplink import sensor as tplink_sensor
 
+    from homeassistant.components.tplink import switch as tplink_switch
+
     return _Deps(
+        AmbientLight=AmbientLight,
+        tplink_switch=tplink_switch,
         Feature=Feature,
         IotProtocol=IotProtocol,
         Motion=Motion,
@@ -333,6 +340,50 @@ def _patch_kasa_motion(deps: _Deps) -> None:
     Motion._initialize_features = _patched
 
 
+def _ambient_threshold(module: Any) -> int:
+    """Read the active preset's threshold from the current poll."""
+    return module.presets[module.config["dark_index"]]["value"]
+
+
+async def _set_ambient_threshold(module: Any, value: int) -> dict:
+    """Set the threshold for the currently selected preset."""
+    return await module.call(
+        "set_brt_level", {"index": module.config["dark_index"], "value": int(value)}
+    )
+
+
+def _patch_kasa_ambient(deps: _Deps) -> None:
+    ambient = deps.AmbientLight
+    original = ambient._initialize_features
+    if getattr(original, "_ambient_threshold_patched", False):
+        return
+
+    def initialize(module) -> None:
+        original(module)
+        try:
+            _ambient_threshold(module)
+        except (IndexError, KeyError, TypeError):
+            return
+        feature = deps.Feature
+        module._add_feature(
+            feature(
+                device=module._device,
+                container=module,
+                id="ambient_light_darkness_threshold",
+                name="Ambient light darkness threshold",
+                attribute_getter=_ambient_threshold,
+                attribute_setter=_set_ambient_threshold,
+                type=feature.Type.Number,
+                category=feature.Category.Config,
+                range_getter=lambda: (0, 100),
+                unit_getter=lambda: "%",
+            )
+        )
+
+    initialize._ambient_threshold_patched = True
+    ambient._initialize_features = initialize
+
+
 def _patch_ha_tplink(deps: _Deps) -> None:
     tplink_bs = deps.tplink_bs
     tplink_button = deps.tplink_button
@@ -389,7 +440,18 @@ def _patch_ha_tplink(deps: _Deps) -> None:
     )
     tplink_bs.BINARYSENSOR_DESCRIPTIONS_MAP.setdefault(bs_desc.key, bs_desc)
 
+    switch_desc = deps.tplink_switch.TPLinkSwitchEntityDescription(
+        key="ambient_light_enabled", name="Ambient light enabled"
+    )
+    deps.tplink_switch.SWITCH_DESCRIPTIONS_MAP.setdefault(switch_desc.key, switch_desc)
+
     number_descs = (
+        tplink_number.TPLinkNumberEntityDescription(
+            key="ambient_light_darkness_threshold",
+            name="Ambient light darkness threshold",
+            mode=NumberMode.BOX,
+            native_unit_of_measurement=PERCENTAGE,
+        ),
         tplink_number.TPLinkNumberEntityDescription(
             key="pir_cold_time",
             name="Motion inactivity timeout",
@@ -495,6 +557,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             return False
     try:
         _patch_kasa_motion(deps)
+        _patch_kasa_ambient(deps)
         _patch_ha_tplink(deps)
     except Exception:
         _LOGGER.exception("tplink_pir_patch: setup failed")
