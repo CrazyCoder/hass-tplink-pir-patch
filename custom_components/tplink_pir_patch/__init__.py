@@ -442,7 +442,7 @@ def _patch_ha_tplink(deps: _Deps) -> None:
     tplink_bs.BINARYSENSOR_DESCRIPTIONS_MAP.setdefault(bs_desc.key, bs_desc)
 
     switch_desc = deps.tplink_switch.TPLinkSwitchEntityDescription(
-        key="ambient_light_enabled", name="Ambient light enabled"
+        key="ambient_light_enabled", name="Ambient light"
     )
     deps.tplink_switch.SWITCH_DESCRIPTIONS_MAP.setdefault(switch_desc.key, switch_desc)
 
