@@ -2,6 +2,7 @@
 
 For ES20M / KS200M motion-sensor switches (iot module). Adds:
   - binary_sensor pir_triggered (device_class=motion) — flipped from python-kasa's Sensor
+  - sensor ambient_light (relative brightness percentage)
   - sensor pir_value / pir_percent / pir_adc_* (debug ones disabled by default)
   - number pir_cold_time — inactivity timeout (python-kasa exposes the setter but no Feature)
   - button reboot_safe — reboot that re-arms the PIR afterwards (see _safe_reboot)
@@ -343,6 +344,12 @@ def _patch_ha_tplink(deps: _Deps) -> None:
 
     sensor_descs = (
         tplink_sensor.TPLinkSensorEntityDescription(
+            key="ambient_light",
+            name="Ambient light",
+            native_unit_of_measurement=PERCENTAGE,
+            state_class=SensorStateClass.MEASUREMENT,
+        ),
+        tplink_sensor.TPLinkSensorEntityDescription(
             key="pir_value",
             name="PIR value",
             state_class=SensorStateClass.MEASUREMENT,
@@ -416,9 +423,8 @@ def _patch_ha_tplink(deps: _Deps) -> None:
     )
     tplink_button.BUTTON_DESCRIPTIONS_MAP.setdefault(button_desc.key, button_desc)
 
-    # pir_triggered is Feature.Category.Primary; on Dimmer the integration filters
-    # Primary features unless explicitly allowlisted.
-    tplink_entity.FEATURES_ALLOW_LIST.add("pir_triggered")
+    # Dimmer entities filter out primary features unless explicitly allowlisted.
+    tplink_entity.FEATURES_ALLOW_LIST.update(("pir_triggered", "ambient_light"))
 
     # HA's tplink integration calls dataclasses.replace(desc, name=UNDEFINED) on
     # every description, clobbering any explicit name we set above. For features

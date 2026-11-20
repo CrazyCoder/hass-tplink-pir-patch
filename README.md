@@ -22,6 +22,7 @@ For each supported Kasa motion-sensor switch:
 | `number.<name>_motion_sensor_threshold` | 0–100. Lower = more sensitive. |
 | `select.<name>_motion_sensor_range` | Far / Mid / Near preset (default Far). |
 | `number.<name>_motion_inactivity_timeout` | Hardware cold_time in ms (default 60000). Affects the switch's built-in auto-on behavior, not the binary_sensor. |
+| `sensor.<name>_ambient_light` | Relative ambient brightness (%) on devices that report it. Uses the existing TP-Link poll. |
 | `sensor.<name>_pir_value` | Signed deviation of the ADC reading from midpoint (the value compared to the threshold). |
 | `sensor.<name>_pir_percentile` | Same, expressed as `%` of half-range. |
 | `sensor.<name>_pir_adc_value` / `_min` / `_mid` / `_max` | Raw ADC (disabled-by-default diagnostic entities). |
@@ -292,7 +293,7 @@ It then applies five runtime patches:
    `SELECT_DESCRIPTIONS_MAP`) get entries for each new feature, each with an
    explicit `name=` since there's no `strings.json` translation for these keys.
 
-3. **`tplink.entity.FEATURES_ALLOW_LIST`** has `pir_triggered` added.
+3. **`tplink.entity.FEATURES_ALLOW_LIST`** has `pir_triggered` and `ambient_light` added.
    `Feature.Category.Primary` features are filtered out for Dimmer device-types
    (where the light entity is the primary) unless explicitly allowlisted.
 
