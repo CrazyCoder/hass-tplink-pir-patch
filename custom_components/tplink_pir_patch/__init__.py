@@ -14,6 +14,7 @@ mutated before tplink forwards its platform setups — see async_setup.
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 import logging
 import string
 import time
@@ -372,7 +373,7 @@ def _patch_kasa_ambient(deps: _Deps) -> None:
                 id="ambient_light_darkness_threshold",
                 name="Ambient light darkness threshold",
                 attribute_getter=_ambient_threshold,
-                attribute_setter=_set_ambient_threshold,
+                attribute_setter=partial(_set_ambient_threshold, module),
                 type=feature.Type.Number,
                 category=feature.Category.Config,
                 range_getter=lambda: (0, 100),
